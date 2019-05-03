@@ -26,12 +26,18 @@
 #include "lib/socket.h"
 #include "lib/string.h"
 #include "lib/hash.h"
+#include "lib/birdlib.h"
 #include "conf/conf.h"
 
 #include <asm/types.h>
-#include <linux/if.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#ifdef WITH_WIREGUARD
+#include "stdlib.h" // free()
+#include "wireguard.h"
+#else
+#include <linux/if.h>
+#endif
 
 #ifdef HAVE_MPLS_KERNEL
 #include <linux/lwtunnel.h>
@@ -1176,6 +1182,123 @@ nh_bufsize(struct nexthop *nh)
   return rv;
 }
 
+#ifdef WITH_WIREGUARD
+static inline bool nl_net_overlaps(ip_addr a, ip_addr b, u32 cidr, u32 family)
+{
+  u32 i;
+  u32 mask;
+
+  // v6-mapped v4 addresses
+  if (family == AF_INET)
+    cidr += (128 - 32);
+
+  for (i=0; i<4; i++) {
+    mask = ~0;
+    if ((cidr - i*32) / 32 < 1)
+      mask <<= 32 - cidr%32;
+
+    if ((a.addr[i] & mask) != (b.addr[i] & mask))
+      return false;
+  }
+  return true;
+}
+
+static void nl_handle_wireguard(char *iface, int op, ip_addr gw, net_addr *net)
+{
+  int err;
+  wg_device *dev; // Current device
+  wg_peer *peer; // Current peer in the list
+  wg_peer *viathis = NULL; // Route via this peer
+  u8 viathisCidr = 0; // viathis has this CIDR
+  wg_allowedip *allowedip; // Current IP in the list
+  ip_addr allowedip2; // The same, but as ip_addr
+  wg_allowedip *previp; // Previous IP in the list
+  bool freed; // Whether this allowed IP was freed
+  struct wg_allowedip *new_ip; // New allowed IP to insert
+
+  DBG("nl_handle_wireguard: %s route to %N on %s", op ? "Adding" : "Removing", net, iface);
+
+  err = wg_get_device(&dev, iface);
+  if (err != 0)
+    return; // No kernel support or not a Wireguard interface
+
+  wg_for_each_peer(dev, peer)
+  {
+    previp = NULL;
+    wg_for_each_allowedip(peer, allowedip)
+    {
+      freed = false;
+      // Only if everything is v4/v6
+      if ((allowedip->family == AF_INET && ipa_is_ip4(gw) && net->type == NET_IP4)
+        || (allowedip->family == AF_INET6 && ipa_is_ip6(gw) && net->type == NET_IP6))
+      {
+        // We need the allowed IP as ipa
+        allowedip2 = allowedip->family == AF_INET6 ? ipa_from_in6(allowedip->ip6) : ipa_from_in4(allowedip->ip4);
+        // Handle gateway (route via this peer?)
+        if (ipa_nonzero(gw) && nl_net_overlaps(allowedip2, gw, MIN(allowedip->cidr, net->pxlen), allowedip->family))
+          if (viathis == NULL || viathisCidr < allowedip->cidr)
+          {
+            viathis = peer;
+            viathisCidr = allowedip->cidr;
+          }
+
+        // Handle network (do we need to remove the net from a peer?)
+        if (nl_net_overlaps(allowedip2, net_prefix(net), MAX(allowedip->cidr, net->pxlen), allowedip->family)) {
+          // Remove the IP
+          if (previp == NULL)
+            // This was the first
+            peer->first_allowedip = allowedip->next_allowedip;
+          else
+            // This was somewhere in the middle
+            previp->next_allowedip = allowedip->next_allowedip;
+          if (peer->last_allowedip == allowedip) {
+            // This was the last IP
+            peer->last_allowedip = previp;
+            previp->next_allowedip = NULL;
+          }
+          peer->flags |= WGPEER_REPLACE_ALLOWEDIPS;
+          free(allowedip);
+          freed = true;
+        }
+      }
+      if (!freed)
+        previp = allowedip;
+    }
+  }
+
+  // Skip this if the route is to be removed
+  if (op != NL_OP_DELETE && viathis != NULL)
+  {
+    // Add new IP
+    new_ip = malloc(sizeof(wg_allowedip));
+    new_ip->cidr = net->pxlen;
+    new_ip->next_allowedip = NULL;
+    if (net->type == NET_IP4)
+    {
+      new_ip->family = AF_INET;
+      new_ip->ip4 = ipa_to_in4(net_prefix(net));
+    }
+    else
+    {
+      new_ip->family = AF_INET6;
+      new_ip->ip6 = ipa_to_in6(net_prefix(net));
+    }
+
+    viathis->flags |= WGPEER_REPLACE_ALLOWEDIPS;
+    viathis->last_allowedip->next_allowedip = new_ip;
+    viathis->last_allowedip = new_ip;
+  }
+
+  err = wg_set_device(dev);
+  if (err != 0)
+    log(L_WARN "Could not update Wireguard interface because of error %d", err);
+
+  wg_free_device(dev);
+  return;
+
+}
+#endif
+
 static int
 nl_send_route(struct krt_proto *p, rte *e, int op, int dest, struct nexthop *nh)
 {
@@ -1299,14 +1422,13 @@ dest:
     case RTD_UNICAST:
       r->r.rtm_type = RTN_UNICAST;
       if (nh->next && !krt_ecmp6(p))
-	nl_add_multipath(&r->h, rsize, nh, p->af);
+        nl_add_multipath(&r->h, rsize, nh, p->af);
       else
       {
-	nl_add_attr_u32(&r->h, rsize, RTA_OIF, nh->iface->index);
-	nl_add_nexthop(&r->h, rsize, nh, p->af);
-
-	if (nh->flags & RNF_ONLINK)
-	  r->r.rtm_flags |= RTNH_F_ONLINK;
+        nl_add_attr_u32(&r->h, rsize, RTA_OIF, nh->iface->index);
+        nl_add_nexthop(&r->h, rsize, nh, p->af);
+        if (nh->flags & RNF_ONLINK)
+          r->r.rtm_flags |= RTNH_F_ONLINK;
       }
       break;
     case RTD_BLACKHOLE:
@@ -1323,6 +1445,11 @@ dest:
     default:
       bug("krt_capable inconsistent with nl_send_route");
     }
+#ifdef WITH_WIREGUARD
+    if ((dest == RTD_UNICAST && ipa_nonzero(nh->gw)) || op == NL_OP_DELETE)
+      nl_handle_wireguard(nh->iface->name, op, nh->gw, net->n.addr);
+#endif
+
 
   /* Ignore missing for DELETE */
   return nl_exchange(&r->h, (op == NL_OP_DELETE));
@@ -1358,7 +1485,7 @@ nl_delete_rte(struct krt_proto *p, rte *e)
 
   /* For IPv6, we just repeatedly request DELETE until we get error */
   do
-    err = nl_send_route(p, e, NL_OP_DELETE, RTD_NONE, NULL);
+    err = nl_send_route(p, e, NL_OP_DELETE, RTD_NONE, &(e->attrs->nh));
   while (krt_ecmp6(p) && !err);
 
   return err;

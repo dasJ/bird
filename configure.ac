@@ -42,6 +42,12 @@ AC_ARG_ENABLE([mpls-kernel],
   [enable_mpls_kernel=try]
 )
 
+AC_ARG_ENABLE([wireguard],
+  [AS_HELP_STRING([--enable-wireguard], [enable WireGuard interface support @<:@yes@:>@])],
+  [],
+  [enable_wireguard=yes]
+)
+
 AC_ARG_WITH([protocols],
   [AS_HELP_STRING([--with-protocols=LIST], [include specified routing protocols @<:@all@:>@])],
   [],
@@ -124,6 +130,10 @@ if test "$enable_pthreads" != no ; then
   if test "$enable_pthreads" = try ; then
     enable_pthreads="$bird_cv_lib_pthreads"
   fi
+fi
+
+if test "$enable_wireguard" != no ; then
+  AC_DEFINE([WITH_WIREGUARD], [1], [Define to 1 if WireGuard is enabled])
 fi
 
 if test "$bird_cflags_default" = yes ; then
@@ -427,6 +437,7 @@ AC_MSG_RESULT([        Iproute2 directory:	$iproutedir])
 AC_MSG_RESULT([        System configuration:	$sysdesc])
 AC_MSG_RESULT([        Debugging:		$enable_debug])
 AC_MSG_RESULT([        POSIX threads:		$enable_pthreads])
+AC_MSG_RESULT([        WireGuard:		$enable_wireguard])
 AC_MSG_RESULT([        Routing protocols:	$protocols])
 AC_MSG_RESULT([        Kernel MPLS support:	$enable_mpls_kernel])
 AC_MSG_RESULT([        Client:			$enable_client])
